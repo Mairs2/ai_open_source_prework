@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MMORPG Client - World Viewer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <canvas id="world-canvas" aria-label="World Map"></canvas>
+    <div
+      id="status"
+      style="
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        background: rgba(0, 0, 0, 0.8);
+        color: white;
+        padding: 10px;
+        font-family: monospace;
+        font-size: 12px;
+        border-radius: 5px;
+        border: 1px solid #333;
+        min-width: 200px;
+      "
+    >
+      <div id="status-connection">Connecting...</div>
+      <div id="status-players">Players: 0</div>
+      <div id="status-position">Position: (0, 0)</div>
+      <div id="status-fps">FPS: 0</div>
+    </div>
+    <div
+      id="minimap"
+      style="
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        width: 200px;
+        height: 200px;
+        background: rgba(0, 0, 0, 0.7);
+        border: 2px solid white;
+      "
+    >
+      <canvas
+        id="minimap-canvas"
+        width="200"
+        height="200"
+        style="width: 100%; height: 100%"
+      ></canvas>
+    </div>
+
+    <script>
+      (function () {
+        const canvas = document.getElementById("world-canvas");
+        const context = canvas.getContext("2d", { alpha: false });
+
+        const minimapCanvas = document.getElementById("minimap-canvas");
+        const minimapContext = minimapCanvas.getContext("2d", { alpha: false });
+
+        const worldImage = new Image();
+        worldImage.src = "world.jpg";
+        let imageReady = false;
+
+        worldImage.addEventListener("load", () => {
+          imageReady = true;
+          state.world.width = worldImage.naturalWidth;
+          state.world.height = worldImage.naturalHeight;
+          draw();
+        });
+
+        const WS_URL = "wss://codepath-mmorg.onrender.com";
+
+        const state = {
+          connectionOpened: false,
+          playerId: null,
+          players: {}, // id -> player
+          avatars: {}, // name -> { frames: { north:[], south:[], east:[] } }
+          my: {
+            username: "Mary",
+          },
+          myAvatarBitmaps: {
+            north: [],
+            south: [],
+            east: [],
+          },
+          world: {
+            width: 0,
+            height: 0,
+          },
+          camera: { x: 0, y: 0 },
+          debug: {
+            enabled: false,
+            messageCount: 0,
+            lastMessageTime: 0,
+            fps: 0,
+            frameCount: 0,
+            lastFpsTime: 0,
+          },
+        };
+
+        const socket = new WebSocket(WS_URL);
+        socket.addEventListener("open", () => {
+          state.connectionOpened = true;
+          console.log("WebSocket connected to server");
+          document.getElementById("status-connection").textContent =
+            "Connected - Joining...";
+          // Join with username "Mary"
+          const join = { action: "join_game", username: state.my.username };
+          socket.send(JSON.stringify(join));
+        });
+
+        socket.addEventListener("error", (error) => {
+          console.error("WebSocket error:", error);
+        });
+
+        socket.addEventListener("close", (event) => {
+          console.log("WebSocket closed:", event.code, event.reason);
+        });
+
+        socket.addEventListener("message", (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            state.debug.messageCount++;
+            state.debug.lastMessageTime = Date.now();
+
+            // Debug mode: log all messages
+            if (state.debug.enabled) {
+              console.log(
+                `[${state.debug.messageCount}] Received:`,
+                data.action,
+                data
+              );
+            } else if (data.action !== "players_moved") {
+              console.log("Received message:", data.action, data);
+            }
+
+            if (data.action === "join_game" && data.success) {
+              state.playerId = data.playerId;
+              state.players = data.players || {};
+              state.avatars = data.avatars || {};
+
+              console.log(
+                "Join response - Players:",
+                Object.keys(state.players),
+                state.players
+              );
+              console.log(
+                "Join response - Avatars:",
+                Object.keys(state.avatars),
+                state.avatars
+              );
+
+              const playerCount = Object.keys(state.players).length;
+              document.getElementById("status-connection").textContent =
+                "Joined!";
+              document.getElementById(
+                "status-players"
+              ).textContent = `Players: ${playerCount}`;
+
+              // Log all players for debugging
+              console.log("=== SERVER ANALYSIS ===");
+              console.log("All players on server:");
+              for (const id in state.players) {
+                const p = state.players[id];
+                const isAI = p.username && p.username.includes("Player");
+                console.log(
+                  `- ${p.username} (${id}) at (${p.x}, ${p.y}) ${
+                    isAI ? "[AI]" : "[HUMAN]"
+                  }`
+                );
+              }
+              console.log("Available avatars:", Object.keys(state.avatars));
+              console.log("Total avatars:", Object.keys(state.avatars).length);
+              console.log("========================");
+
+              const me = state.players[state.playerId];
+              if (me) {
+                // Initialize camera relative to my spawn
+                updateCamera();
+
+                const myAvatarName = me.avatar;
+                const avatarDef = state.avatars[myAvatarName];
+                if (avatarDef && avatarDef.frames) {
+                  // Load my frames as ImageBitmaps for efficient rendering
+                  prepareMyAvatarBitmaps(avatarDef.frames).then(() => {
+                    // Ready to render avatar
+                  });
+                }
+              }
+
+              // Load avatar frames for all players
+              loadAllPlayerAvatars();
+            } else if (data.action === "players_moved" && data.players) {
+              // Merge updates from server
+              const updates = data.players;
+              // Only log movement updates occasionally to reduce spam
+              if (Math.random() < 0.1) {
+                console.log("Players moved:", Object.keys(updates));
+              }
+              for (const id in updates) {
+                if (!Object.prototype.hasOwnProperty.call(updates, id))
+                  continue;
+                const p = updates[id];
+                const existing = state.players[id] || {};
+                const oldPos = { x: existing.x, y: existing.y };
+                state.players[id] = {
+                  ...existing,
+                  ...p,
+                };
+
+                // Log significant position changes
+                if (oldPos.x !== p.x || oldPos.y !== p.y) {
+                  const distance = Math.sqrt(
+                    (p.x - oldPos.x) ** 2 + (p.y - oldPos.y) ** 2
+                  );
+                  if (distance > 10) {
+                    // Only log significant movements
+                    console.log(
+                      `Player ${p.username || id} moved from (${oldPos.x}, ${
+                        oldPos.y
+                      }) to (${p.x}, ${p.y})`
+                    );
+                  }
+                }
+              }
+              console.log("Updated players state:", Object.keys(state.players));
+            } else if (data.action === "player_joined") {
+              // Add new player
+              const player = data.player;
+              const avatar = data.avatar;
+              if (player) {
+                state.players[player.id] = player;
+                if (avatar) {
+                  state.avatars[avatar.name] = avatar;
+                }
+                console.log(
+                  "Player joined:",
+                  player.username,
+                  "Total players:",
+                  Object.keys(state.players).length
+                );
+                loadPlayerAvatar(player);
+              }
+            } else if (data.action === "player_left") {
+              // Remove player
+              const playerId = data.playerId;
+              if (state.players[playerId]) {
+                console.log("Player left:", state.players[playerId].username);
+                delete state.players[playerId];
+                delete avatarBitmaps[playerId];
+              }
+            }
+          } catch (err) {
+            // Silently ignore malformed messages for now
+          }
+        });
+
+        // Keyboard movement handling
+        const pressedDirections = new Set();
+        const arrowToDirection = {
+          ArrowUp: "up",
+          ArrowDown: "down",
+          ArrowLeft: "left",
+          ArrowRight: "right",
+        };
+
+        function sendMove(direction) {
+          if (!state.connectionOpened || !state.playerId) return;
+          try {
+            socket.send(JSON.stringify({ action: "move", direction }));
+          } catch (e) {}
+        }
+
+        function sendStop() {
+          if (!state.connectionOpened || !state.playerId) return;
+          try {
+            socket.send(JSON.stringify({ action: "stop" }));
+          } catch (e) {}
+        }
+
+        function onKeyDown(e) {
+          const dir = arrowToDirection[e.key];
+          if (!dir) return;
+          e.preventDefault();
+          // Track pressed key; allow browser keydown repeats to generate more move messages
+          if (!pressedDirections.has(dir)) {
+            pressedDirections.add(dir);
+            // Update local facing for responsiveness
+            const me = state.players[state.playerId];
+            if (me) {
+              me.facing =
+                dir === "left"
+                  ? "west"
+                  : dir === "right"
+                  ? "east"
+                  : dir === "up"
+                  ? "north"
+                  : "south";
+              me.isMoving = true;
+            }
+          }
+          sendMove(dir);
+        }
+
+        function onKeyUp(e) {
+          const dir = arrowToDirection[e.key];
+          if (!dir) return;
+          e.preventDefault();
+          pressedDirections.delete(dir);
+          const me = state.players[state.playerId];
+          if (me && pressedDirections.size === 0) {
+            me.isMoving = false;
+            sendStop();
+          }
+        }
+
+        function onBlur() {
+          if (pressedDirections.size > 0) {
+            pressedDirections.clear();
+            sendStop();
+          }
+        }
+
+        window.addEventListener("keydown", onKeyDown);
+        window.addEventListener("keyup", onKeyUp);
+        window.addEventListener("blur", onBlur);
+
+        // Debug and help shortcuts
+        window.addEventListener("keydown", (e) => {
+          if (e.key === "d" && e.ctrlKey) {
+            e.preventDefault();
+            state.debug.enabled = !state.debug.enabled;
+            console.log("Debug mode:", state.debug.enabled ? "ON" : "OFF");
+            if (state.debug.enabled) {
+              console.log("=== DEBUG MODE ENABLED ===");
+              console.log("All server messages will be logged");
+              console.log("Press Ctrl+D again to disable");
+            }
+          } else if (e.key === "h" && e.ctrlKey) {
+            e.preventDefault();
+            showHelp();
+          } else if (e.key === "s" && e.ctrlKey) {
+            e.preventDefault();
+            scanServer();
+          }
+        });
+
+        // Global avatar bitmap cache for all players
+        const avatarBitmaps = {}; // playerId -> { north: [], south: [], east: [] }
+
+        async function prepareMyAvatarBitmaps(frames) {
+          const dirs = ["north", "south", "east"];
+          for (const dir of dirs) {
+            const urls = frames[dir] || [];
+            const bitmaps = await Promise.all(
+              urls.map(async (u) => {
+                try {
+                  const response = await fetch(u);
+                  const blob = await response.blob();
+                  const bmp = await createImageBitmap(blob);
+                  return bmp;
+                } catch (e) {
+                  return null;
+                }
+              })
+            );
+            state.myAvatarBitmaps[dir] = bitmaps.filter(Boolean);
+          }
+        }
+
+        async function loadPlayerAvatar(player) {
+          if (!player || !player.avatar) return;
+
+          const avatarDef = state.avatars[player.avatar];
+          if (!avatarDef || !avatarDef.frames) return;
+
+          console.log(
+            "Loading avatar for player:",
+            player.username,
+            "avatar:",
+            player.avatar
+          );
+
+          const playerBitmaps = { north: [], south: [], east: [] };
+          const dirs = ["north", "south", "east"];
+
+          for (const dir of dirs) {
+            const urls = avatarDef.frames[dir] || [];
+            const bitmaps = await Promise.all(
+              urls.map(async (u) => {
+                try {
+                  const response = await fetch(u);
+                  const blob = await response.blob();
+                  const bmp = await createImageBitmap(blob);
+                  return bmp;
+                } catch (e) {
+                  console.warn("Failed to load avatar frame:", e);
+                  return null;
+                }
+              })
+            );
+            playerBitmaps[dir] = bitmaps.filter(Boolean);
+          }
+
+          avatarBitmaps[player.id] = playerBitmaps;
+          console.log(
+            "Loaded avatar for",
+            player.username,
+            "frames:",
+            playerBitmaps
+          );
+        }
+
+        async function loadAllPlayerAvatars() {
+          for (const playerId in state.players) {
+            const player = state.players[playerId];
+            if (player && player.id !== state.playerId) {
+              await loadPlayerAvatar(player);
+            }
+          }
+        }
+
+        function resizeCanvasToWindow() {
+          const dpr = window.devicePixelRatio || 1;
+          const cssWidth = window.innerWidth;
+          const cssHeight = window.innerHeight;
+
+          // Set the CSS size so the canvas fills the viewport
+          canvas.style.width = cssWidth + "px";
+          canvas.style.height = cssHeight + "px";
+
+          // Set the backing store size for crisp rendering on HiDPI screens
+          canvas.width = Math.max(1, Math.floor(cssWidth * dpr));
+          canvas.height = Math.max(1, Math.floor(cssHeight * dpr));
+
+          // Map 1 canvas unit to 1 CSS pixel
+          context.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+
+        function clear() {
+          // Clear in device pixels regardless of current transform
+          context.save();
+          context.setTransform(1, 0, 0, 1, 0, 0);
+          context.clearRect(0, 0, canvas.width, canvas.height);
+          context.restore();
+        }
+
+        function draw() {
+          clear();
+          const viewportWidth = window.innerWidth;
+          const viewportHeight = window.innerHeight;
+
+          // Draw world sub-rectangle based on camera, clamped to edges.
+          if (imageReady) {
+            const { x: camX, y: camY } = state.camera;
+            const worldW = state.world.width || worldImage.naturalWidth;
+            const worldH = state.world.height || worldImage.naturalHeight;
+
+            // When world smaller than viewport, center it and letterbox
+            const needsCenterX = worldW < viewportWidth;
+            const needsCenterY = worldH < viewportHeight;
+
+            const sx = needsCenterX
+              ? 0
+              : Math.max(0, Math.min(worldW - viewportWidth, camX));
+            const sy = needsCenterY
+              ? 0
+              : Math.max(0, Math.min(worldH - viewportHeight, camY));
+            const sw = Math.min(viewportWidth, worldW);
+            const sh = Math.min(viewportHeight, worldH);
+            const dx = needsCenterX
+              ? Math.floor((viewportWidth - worldW) / 2)
+              : 0;
+            const dy = needsCenterY
+              ? Math.floor((viewportHeight - worldH) / 2)
+              : 0;
+
+            context.drawImage(worldImage, sx, sy, sw, sh, dx, dy, sw, sh);
+          }
+
+          // Draw all players
+          const me = state.players[state.playerId];
+          const { x: camX, y: camY } = state.camera;
+
+          // Only log drawing info occasionally to reduce spam
+          if (Math.random() < 0.01) {
+            // 1% chance
+            console.log(
+              "Drawing players:",
+              Object.keys(state.players),
+              "Camera:",
+              camX,
+              camY
+            );
+          }
+
+          for (const playerId in state.players) {
+            const player = state.players[playerId];
+            if (!player) continue;
+
+            // Calculate screen position based on world position and camera
+            const worldX = player.x || 0;
+            const worldY = player.y || 0;
+            const screenX = worldX - camX;
+            const screenY = worldY - camY;
+
+            // Debug: Log player positions occasionally
+            if (Math.random() < 0.01) {
+              console.log(
+                `Player ${
+                  player.username || playerId
+                }: world(${worldX}, ${worldY}) screen(${screenX}, ${screenY}) camera(${camX}, ${camY})`
+              );
+
+              // Specifically log AI player position
+              if (player.username && player.username.includes("Player")) {
+                console.log(
+                  `AI Player ${player.username} position: (${worldX}, ${worldY})`
+                );
+              }
+            }
+
+            // Only draw if player is visible on screen
+            if (
+              screenX < -50 ||
+              screenX > viewportWidth + 50 ||
+              screenY < -50 ||
+              screenY > viewportHeight + 50
+            ) {
+              if (Math.random() < 0.01) {
+                console.log(
+                  `Player ${
+                    player.username || playerId
+                  } is off-screen: screen(${screenX}, ${screenY}) viewport(${viewportWidth}, ${viewportHeight})`
+                );
+              }
+              continue;
+            }
+
+            // Get avatar frame for this player
+            const frames = getPlayerFrames(player);
+            let bmp = null;
+
+            if (frames && frames.frameBitmap) {
+              bmp = frames.frameBitmap;
+            } else {
+              // Fallback: draw a colored rectangle for players without avatars
+              const colors = [
+                "#ff6b6b",
+                "#4ecdc4",
+                "#45b7d1",
+                "#96ceb4",
+                "#feca57",
+                "#ff9ff3",
+              ];
+              const colorIndex =
+                playerId.split("").reduce((a, b) => a + b.charCodeAt(0), 0) %
+                colors.length;
+              const color = colors[colorIndex];
+
+              // Draw colored rectangle
+              context.fillStyle = color;
+              context.fillRect(screenX - 15, screenY - 15, 30, 30);
+
+              // Draw border
+              context.strokeStyle = "#000";
+              context.lineWidth = 2;
+              context.strokeRect(screenX - 15, screenY - 15, 30, 30);
+
+              // Username label above fallback avatar
+              context.font = "14px sans-serif";
+              context.textAlign = "center";
+              context.textBaseline = "bottom";
+              const labelY = screenY - 20;
+              context.lineWidth = 3;
+              context.strokeStyle = "#000";
+              context.fillStyle = "#fff";
+              context.strokeText(player.username || "Player", screenX, labelY);
+              context.fillText(player.username || "Player", screenX, labelY);
+
+              continue; // Skip the normal avatar rendering
+            }
+
+            const drawW = bmp.width;
+            const drawH = bmp.height;
+            context.imageSmoothingEnabled = false;
+
+            const facing = player.facing || "south";
+            if (facing === "west") {
+              // Flip horizontally using east frames
+              context.save();
+              const centerX = Math.round(screenX);
+              const centerY = Math.round(screenY);
+              context.translate(centerX, centerY);
+              context.scale(-1, 1);
+              context.drawImage(
+                bmp,
+                Math.round(-drawW / 2),
+                Math.round(-drawH / 2),
+                drawW,
+                drawH
+              );
+              context.restore();
+            } else {
+              context.drawImage(
+                bmp,
+                Math.round(screenX - drawW / 2),
+                Math.round(screenY - drawH / 2),
+                drawW,
+                drawH
+              );
+            }
+
+            // Username label above avatar
+            context.font = "14px sans-serif";
+            context.textAlign = "center";
+            context.textBaseline = "bottom";
+            const labelY = Math.round(screenY - drawH / 2 - 6);
+            context.lineWidth = 3;
+            context.strokeStyle = "#000";
+            context.fillStyle = "#fff";
+            context.strokeText(player.username || "Player", screenX, labelY);
+            context.fillText(player.username || "Player", screenX, labelY);
+          }
+
+          // Draw minimap
+          drawMinimap();
+        }
+
+        function drawMinimap() {
+          // Clear minimap
+          minimapContext.clearRect(0, 0, 200, 200);
+
+          const worldW = state.world.width || worldImage.naturalWidth || 2048;
+          const worldH = state.world.height || worldImage.naturalHeight || 2048;
+          const scale = Math.min(200 / worldW, 200 / worldH);
+
+          // Draw world outline
+          minimapContext.strokeStyle = "#666";
+          minimapContext.lineWidth = 2;
+          minimapContext.strokeRect(0, 0, worldW * scale, worldH * scale);
+
+          // Draw all players as dots
+          const playerIds = Object.keys(state.players);
+          for (let i = 0; i < playerIds.length; i++) {
+            const playerId = playerIds[i];
+            const player = state.players[playerId];
+            if (!player) continue;
+
+            const x = (player.x || 0) * scale;
+            const y = (player.y || 0) * scale;
+
+            // Different colors for different players
+            const isMe = playerId === state.playerId;
+            const colors = [
+              "#00ff00",
+              "#ff0000",
+              "#0000ff",
+              "#ffff00",
+              "#ff00ff",
+              "#00ffff",
+            ];
+            const colorIndex = isMe ? 0 : (i % (colors.length - 1)) + 1;
+
+            minimapContext.fillStyle = colors[colorIndex];
+            minimapContext.beginPath();
+            minimapContext.arc(x, y, isMe ? 5 : 4, 0, Math.PI * 2);
+            minimapContext.fill();
+
+            // Draw border
+            minimapContext.strokeStyle = "#000";
+            minimapContext.lineWidth = 1;
+            minimapContext.stroke();
+
+            // Draw player name (only if there's space)
+            if (x < 180 && y > 15) {
+              minimapContext.fillStyle = "#fff";
+              minimapContext.font = "9px sans-serif";
+              minimapContext.fillText(
+                player.username || "Player",
+                x + 6,
+                y - 6
+              );
+            }
+          }
+
+          // Draw player count
+          minimapContext.fillStyle = "#fff";
+          minimapContext.font = "12px sans-serif";
+          minimapContext.fillText(`Players: ${playerIds.length}`, 5, 15);
+        }
+
+        function handleResize() {
+          resizeCanvasToWindow();
+          updateCamera();
+          draw();
+        }
+
+        // Initialize
+        resizeCanvasToWindow();
+        draw();
+
+        // Redraw on resize
+        window.addEventListener("resize", handleResize);
+
+        function getPlayerFrames(player) {
+          const me = state.players[state.playerId];
+          if (!player) return null;
+
+          // For my own player, use cached bitmaps
+          if (player === me) {
+            let dir = player.facing || "south";
+            if (dir === "west") dir = "east";
+            const frames = state.myAvatarBitmaps[dir] || [];
+            if (!frames.length) return null;
+            const idx = player.animationFrame
+              ? Math.max(0, Math.min(frames.length - 1, player.animationFrame))
+              : 0;
+            return { frameBitmap: frames[idx] };
+          }
+
+          // For other players, use global avatar cache
+          const playerBitmaps = avatarBitmaps[player.id];
+          if (!playerBitmaps) return null;
+
+          let dir = player.facing || "south";
+          if (dir === "west") dir = "east";
+          const frames = playerBitmaps[dir] || [];
+          if (!frames.length) return null;
+
+          const idx = player.animationFrame
+            ? Math.max(0, Math.min(frames.length - 1, player.animationFrame))
+            : 0;
+          return { frameBitmap: frames[idx] };
+        }
+
+        function getMyCurrentFrame() {
+          const me = state.players[state.playerId];
+          if (!me) return null;
+          return getPlayerFrames(me);
+        }
+
+        function updateCamera() {
+          const viewportWidth = window.innerWidth;
+          const viewportHeight = window.innerHeight;
+          const worldW = state.world.width || worldImage.naturalWidth || 0;
+          const worldH = state.world.height || worldImage.naturalHeight || 0;
+
+          const me = state.players[state.playerId];
+          if (!me) {
+            state.camera.x = 0;
+            state.camera.y = 0;
+            return;
+          }
+
+          let desiredX = Math.floor(me.x - viewportWidth / 2);
+          let desiredY = Math.floor(me.y - viewportHeight / 2);
+
+          // Clamp to world boundaries; if world smaller than viewport, keep 0 to show centered via draw logic
+          if (worldW >= viewportWidth) {
+            desiredX = Math.max(0, Math.min(worldW - viewportWidth, desiredX));
+          } else {
+            desiredX = 0;
+          }
+          if (worldH >= viewportHeight) {
+            desiredY = Math.max(0, Math.min(worldH - viewportHeight, desiredY));
+          } else {
+            desiredY = 0;
+          }
+
+          state.camera.x = desiredX;
+          state.camera.y = desiredY;
+        }
+
+        // FPS tracking
+        function updateFPS() {
+          state.debug.frameCount++;
+          const now = Date.now();
+          if (now - state.debug.lastFpsTime >= 1000) {
+            state.debug.fps = Math.round(
+              (state.debug.frameCount * 1000) / (now - state.debug.lastFpsTime)
+            );
+            state.debug.frameCount = 0;
+            state.debug.lastFpsTime = now;
+            document.getElementById(
+              "status-fps"
+            ).textContent = `FPS: ${state.debug.fps}`;
+          }
+        }
+
+        // Update position display
+        function updatePositionDisplay() {
+          const me = state.players[state.playerId];
+          if (me) {
+            document.getElementById(
+              "status-position"
+            ).textContent = `Position: (${Math.round(me.x)}, ${Math.round(
+              me.y
+            )})`;
+          }
+        }
+
+        // Main render loop
+        function loop() {
+          updateFPS();
+          updatePositionDisplay();
+
+          // Update camera each frame in case my position changes later
+          updateCamera();
+          draw();
+          requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+
+        // Help overlay
+        function showHelp() {
+          const help = `
+=== MMORPG CLIENT HELP ===
+Controls:
+- Arrow Keys: Move your character
+- Ctrl+D: Toggle debug mode
+- Ctrl+H: Show this help
+- Ctrl+S: Scan server for players
+
+UI Elements:
+- Top-left: Status panel (connection, players, position, FPS)
+- Top-right: Minimap (shows all players as colored dots)
+- Green dot: You
+- Other colors: Other players
+
+Debug Mode:
+- Shows all server messages in console
+- Helps identify AI players and server behavior
+- Use Ctrl+D to toggle
+
+Server Scan:
+- Analyzes all players and avatars
+- Identifies AI vs human players
+- Shows detailed server information
+          `;
+          console.log(help);
+          alert(help);
+        }
+
+        // Server scanning function
+        function scanServer() {
+          console.log("=== SERVER SCAN ===");
+          console.log(
+            "Connection status:",
+            state.connectionOpened ? "Connected" : "Disconnected"
+          );
+          console.log("Messages received:", state.debug.messageCount);
+          console.log(
+            "Last message:",
+            new Date(state.debug.lastMessageTime).toLocaleTimeString()
+          );
+
+          console.log("\nPlayers Analysis:");
+          const players = Object.values(state.players);
+          const aiPlayers = players.filter(
+            (p) => p.username && p.username.includes("Player")
+          );
+          const humanPlayers = players.filter(
+            (p) => !p.username || !p.username.includes("Player")
+          );
+
+          console.log(`Total players: ${players.length}`);
+          console.log(`AI players: ${aiPlayers.length}`);
+          console.log(`Human players: ${humanPlayers.length}`);
+
+          console.log("\nAI Players:");
+          aiPlayers.forEach((p) => {
+            console.log(`- ${p.username} (${p.id}) at (${p.x}, ${p.y})`);
+          });
+
+          console.log("\nHuman Players:");
+          humanPlayers.forEach((p) => {
+            console.log(`- ${p.username} (${p.id}) at (${p.x}, ${p.y})`);
+          });
+
+          console.log("\nAvatars available:", Object.keys(state.avatars));
+          console.log("==================");
+        }
+      })();
+    </script>
+  </body>
+</html>
